@@ -523,7 +523,8 @@ with tab_private:
 
     st.info(
         "Tài liệu chỉ được giữ trong phiên sử dụng hiện tại và không "
-        "được thêm vào kho dùng chung."
+        "được thêm vào kho dùng chung. Các đoạn liên quan sẽ được gửi "
+        "tới Gemini API để tạo câu trả lời."
     )
 
     private_files = st.file_uploader(
@@ -749,101 +750,207 @@ with tab_admin:
     if admin_allowed:
         st.success("Đã mở quyền quản trị.")
 
-        admin_file = st.file_uploader(
-            "Chọn PDF có lớp chữ",
+        admin_files = st.file_uploader(
+            "Chọn một hoặc nhiều PDF có lớp chữ",
             type=["pdf"],
+            accept_multiple_files=True,
             key="admin_uploader",
+            help=(
+                "Có thể tải nhiều văn bản cùng lúc. "
+                "Mỗi file cần nhập metadata riêng."
+            ),
         )
 
-        document_name = st.text_input("Tên văn bản")
-        document_number = st.text_input("Số hiệu văn bản")
+        admin_entries: list[dict[str, Any]] = []
 
-        topic = st.selectbox(
-            "Chủ đề",
-            [
-                "Thuế giá trị gia tăng",
-                "Hóa đơn điện tử",
-                "Thủ tục khai và nộp thuế",
-            ],
-        )
+        if admin_files:
+            st.caption(
+                f"Đã chọn {len(admin_files)} file. "
+                "Hãy kiểm tra metadata của từng văn bản."
+            )
 
-        status = st.selectbox(
-            "Trạng thái",
-            [
-                "Còn hiệu lực",
-                "Hết hiệu lực",
-                "Chưa xác minh",
-            ],
-        )
+            if len(admin_files) > 20:
+                st.error(
+                    "Mỗi lần chỉ nên xử lý tối đa 20 file để tránh "
+                    "quá tải bộ nhớ."
+                )
 
-        source_url = st.text_input(
-            "URL nguồn chính thức",
-            placeholder="https://...",
-        )
+            for file_index, admin_file in enumerate(
+                admin_files,
+                start=1,
+            ):
+                widget_id = sha256(
+                    (
+                        f"{file_index}|{admin_file.name}|"
+                        f"{admin_file.size}"
+                    ).encode("utf-8")
+                ).hexdigest()[:12]
+
+                default_name = Path(admin_file.name).stem
+
+                with st.expander(
+                    f"{file_index}. {admin_file.name}",
+                    expanded=(len(admin_files) <= 3),
+                ):
+                    document_name = st.text_input(
+                        "Tên văn bản",
+                        value=default_name,
+                        key=f"admin_name_{widget_id}",
+                    )
+
+                    document_number = st.text_input(
+                        "Số hiệu văn bản",
+                        placeholder="Ví dụ: 48/2024/QH15",
+                        key=f"admin_number_{widget_id}",
+                    )
+
+                    topic = st.selectbox(
+                        "Chủ đề",
+                        [
+                            "Thuế giá trị gia tăng",
+                            "Hóa đơn điện tử",
+                            "Thủ tục khai và nộp thuế",
+                        ],
+                        key=f"admin_topic_{widget_id}",
+                    )
+
+                    status = st.selectbox(
+                        "Trạng thái",
+                        [
+                            "Còn hiệu lực",
+                            "Hết hiệu lực",
+                            "Chưa xác minh",
+                        ],
+                        key=f"admin_status_{widget_id}",
+                    )
+
+                    source_url = st.text_input(
+                        "URL nguồn chính thức",
+                        placeholder="https://...",
+                        key=f"admin_url_{widget_id}",
+                    )
+
+                admin_entries.append(
+                    {
+                        "file": admin_file,
+                        "document_name": document_name.strip(),
+                        "document_number": document_number.strip(),
+                        "topic": topic,
+                        "status": status,
+                        "source_url": source_url.strip(),
+                    }
+                )
 
         if st.button(
-            "Xử lý và lưu vào kho dùng chung",
+            "Xử lý và lưu tất cả vào kho dùng chung",
             type="primary",
+            disabled=not admin_files or len(admin_files) > 20,
         ):
-            if admin_file is None:
-                st.error("Bạn chưa chọn PDF.")
-            elif not document_name.strip():
-                st.error("Bạn chưa nhập tên văn bản.")
-            elif not document_number.strip():
-                st.error("Bạn chưa nhập số hiệu văn bản.")
-            else:
-                metadata = {
-                    "document_name": document_name.strip(),
-                    "document_number": document_number.strip(),
-                    "topic": topic,
-                    "status": status,
-                    "source_url": source_url.strip(),
-                }
+            missing_metadata = [
+                entry["file"].name
+                for entry in admin_entries
+                if not entry["document_name"]
+                or not entry["document_number"]
+            ]
 
-                try:
-                    with st.spinner("Đang xử lý PDF..."):
+            if missing_metadata:
+                st.error(
+                    "Các file sau còn thiếu tên văn bản hoặc số hiệu: "
+                    + ", ".join(missing_metadata)
+                )
+            else:
+                current_chunks = load_shared_chunks()
+                successful_files = 0
+                failed_files: list[str] = []
+                total_pages = 0
+                total_chunks = 0
+                total_empty_pages = 0
+
+                progress_bar = st.progress(0)
+                progress_text = st.empty()
+
+                for entry_index, entry in enumerate(
+                    admin_entries,
+                    start=1,
+                ):
+                    uploaded_file = entry["file"]
+
+                    progress_text.write(
+                        f"Đang xử lý {entry_index}/"
+                        f"{len(admin_entries)}: "
+                        f"{uploaded_file.name}"
+                    )
+
+                    metadata = {
+                        "document_name": entry["document_name"],
+                        "document_number": entry["document_number"],
+                        "topic": entry["topic"],
+                        "status": entry["status"],
+                        "source_url": entry["source_url"],
+                    }
+
+                    try:
                         new_chunks, page_count, empty_pages = (
                             pdf_to_chunks(
-                                pdf_bytes=admin_file.getvalue(),
-                                filename=admin_file.name,
+                                pdf_bytes=uploaded_file.getvalue(),
+                                filename=uploaded_file.name,
                                 metadata=metadata,
                                 scope="shared",
                             )
                         )
 
-                    if not new_chunks:
-                        st.error(
-                            "Không trích xuất được chữ. PDF có thể "
-                            "là file scan."
-                        )
-                    else:
-                        existing_chunks = [
-                            item
-                            for item in load_shared_chunks()
-                            if item.get("document_number")
-                            != document_number.strip()
-                        ]
-
-                        save_shared_chunks(
-                            existing_chunks + new_chunks
-                        )
-
-                        st.success(
-                            f"Đã xử lý {page_count} trang và lưu "
-                            f"{len(new_chunks)} đoạn dữ liệu."
-                        )
-
-                        if empty_pages:
-                            st.warning(
-                                f"Có {empty_pages} trang không "
-                                "trích xuất được chữ."
+                        if not new_chunks:
+                            failed_files.append(
+                                f"{uploaded_file.name} "
+                                "(không trích xuất được chữ)"
                             )
+                        else:
+                            current_chunks = [
+                                item
+                                for item in current_chunks
+                                if item.get("document_number")
+                                != entry["document_number"]
+                            ]
 
-                except Exception:
-                    st.error(
-                        "Không thể đọc PDF. File có thể bị lỗi, "
-                        "được bảo vệ hoặc là PDF scan."
+                            current_chunks.extend(new_chunks)
+                            successful_files += 1
+                            total_pages += page_count
+                            total_chunks += len(new_chunks)
+                            total_empty_pages += empty_pages
+
+                    except Exception:
+                        failed_files.append(
+                            f"{uploaded_file.name} "
+                            "(file lỗi, được bảo vệ hoặc là PDF scan)"
+                        )
+
+                    progress_bar.progress(
+                        entry_index / len(admin_entries)
                     )
+
+                if successful_files:
+                    save_shared_chunks(current_chunks)
+
+                    st.success(
+                        f"Đã lưu {successful_files}/"
+                        f"{len(admin_entries)} văn bản, "
+                        f"{total_pages} trang và "
+                        f"{total_chunks} đoạn dữ liệu."
+                    )
+
+                    if total_empty_pages:
+                        st.warning(
+                            f"Có {total_empty_pages} trang không "
+                            "trích xuất được chữ."
+                        )
+
+                if failed_files:
+                    st.error(
+                        "Không xử lý được: "
+                        + "; ".join(failed_files)
+                    )
+
+                progress_text.empty()
 
         st.divider()
 
