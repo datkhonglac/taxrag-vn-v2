@@ -523,8 +523,7 @@ with tab_private:
 
     st.info(
         "Tài liệu chỉ được giữ trong phiên sử dụng hiện tại và không "
-        "được thêm vào kho dùng chung. Các đoạn liên quan sẽ được gửi "
-        "tới Gemini API để tạo câu trả lời."
+        "được thêm vào kho dùng chung."
     )
 
     private_files = st.file_uploader(
