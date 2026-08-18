@@ -1,4 +1,5 @@
 import hmac
+import io
 import json
 import os
 import re
@@ -15,6 +16,8 @@ from scipy.sparse import hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import requests
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter
 
 
 # ============================================================
@@ -31,6 +34,9 @@ load_dotenv()
 
 MAX_PRIVATE_FILES = 5
 MAX_PRIVATE_TOTAL_MB = 30
+OCR_TEXT_THRESHOLD = 120
+OCR_RENDER_SCALE = 2.0
+MAX_OCR_PAGES_PER_FILE = 80
 
 
 def get_setting(name: str, default: str = "") -> str:
@@ -360,23 +366,101 @@ def split_text(
     return chunks
 
 
+
+def text_quality_ok(text: str) -> bool:
+    """
+    Kiểm tra nhanh chất lượng text trước khi quyết định OCR.
+
+    Điều kiện:
+    - Có ít nhất OCR_TEXT_THRESHOLD ký tự.
+    - Ít nhất 70% ký tự là chữ, số hoặc khoảng trắng.
+    """
+    if len(text) < OCR_TEXT_THRESHOLD:
+        return False
+
+    useful = sum(
+        ch.isalnum() or ch.isspace()
+        for ch in text
+    )
+
+    ratio = useful / max(len(text), 1)
+
+    return ratio >= 0.7
+
+
+def preprocess_ocr_image(image: Image.Image) -> Image.Image:
+    """
+    Tiền xử lý nhẹ để OCR tiếng Việt ổn định hơn:
+    grayscale -> tăng tương phản -> sharpen.
+    """
+    image = image.convert("L")
+    image = ImageEnhance.Contrast(image).enhance(1.6)
+    image = image.filter(ImageFilter.SHARPEN)
+    return image
+
+
+def ocr_pdf_page(page: fitz.Page) -> str:
+    """
+    Render một trang PDF thành ảnh rồi OCR bằng Tesseract.
+    Chỉ được gọi khi PyMuPDF không lấy đủ lớp chữ.
+    """
+    matrix = fitz.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
+    pixmap = page.get_pixmap(
+        matrix=matrix,
+        alpha=False,
+    )
+
+    image = Image.open(
+        io.BytesIO(pixmap.tobytes("png"))
+    )
+    image = preprocess_ocr_image(image)
+
+    text = pytesseract.image_to_string(
+        image,
+        lang="vie+eng",
+        config="--oem 3 --psm 6",
+    )
+
+    return clean_text(text)
+
+
 def pdf_to_chunks(
     pdf_bytes: bytes,
     filename: str,
     metadata: dict[str, str] | None = None,
     scope: str = "private",
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    """
+    Trích xuất text theo cơ chế hybrid:
+    1. Ưu tiên lớp chữ có sẵn bằng PyMuPDF.
+    2. Nếu trang gần như không có chữ, tự động fallback sang OCR.
+    3. Nếu OCR vẫn không đọc được thì đánh dấu trang rỗng.
+    """
     metadata = metadata or {}
     chunks: list[dict[str, Any]] = []
     empty_pages = 0
+    ocr_pages = 0
 
     with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
         page_count = len(document)
 
         for page_number, page in enumerate(document, start=1):
             page_text = clean_text(page.get_text("text"))
+            extraction_method = "text"
 
-            if len(page_text) < 50:
+            if not text_quality_ok(page_text):
+                if ocr_pages >= MAX_OCR_PAGES_PER_FILE:
+                    empty_pages += 1
+                    continue
+
+                try:
+                    page_text = ocr_pdf_page(page)
+                    extraction_method = "ocr"
+                    ocr_pages += 1
+                except Exception:
+                    page_text = ""
+
+            if not text_quality_ok(page_text):
                 empty_pages += 1
                 continue
 
@@ -388,6 +472,8 @@ def pdf_to_chunks(
                     ).encode("utf-8")
                 ).hexdigest()
 
+                # Gắn cờ OCR trực tiếp vào chunk cục bộ.
+                # Database hiện tại chưa cần thêm cột mới.
                 chunks.append(
                     {
                         "id": chunk_id,
@@ -415,10 +501,11 @@ def pdf_to_chunks(
                         ),
                         "page": page_number,
                         "content": content,
+                        "extraction_method": extraction_method,
                     }
                 )
 
-    return chunks, page_count, empty_pages
+    return chunks, page_count, empty_pages, ocr_pages
 
 
 # ============================================================
@@ -795,11 +882,12 @@ with tab_private:
                 all_chunks: list[dict[str, Any]] = []
                 document_names: list[str] = []
                 failed_files: list[str] = []
+                total_ocr_pages = 0
 
                 with st.spinner("Đang đọc và chia nhỏ tài liệu..."):
                     for uploaded_file in private_files:
                         try:
-                            chunks, _, _ = pdf_to_chunks(
+                            chunks, _, _, ocr_pages = pdf_to_chunks(
                                 pdf_bytes=uploaded_file.getvalue(),
                                 filename=uploaded_file.name,
                                 scope="private",
@@ -807,6 +895,7 @@ with tab_private:
 
                             if chunks:
                                 all_chunks.extend(chunks)
+                                total_ocr_pages += ocr_pages
                                 document_names.append(
                                     uploaded_file.name
                                 )
@@ -829,6 +918,11 @@ with tab_private:
                         f"Đã đọc {len(document_names)} tài liệu và tạo "
                         f"{len(all_chunks)} đoạn nội dung."
                     )
+                    if total_ocr_pages:
+                        st.info(
+                            f"Hệ thống đã tự động OCR "
+                            f"{total_ocr_pages} trang scan."
+                        )
                 else:
                     st.error(
                         "Không trích xuất được chữ. PDF có thể là "
@@ -1213,6 +1307,7 @@ with tab_admin:
                     failed_files: list[str] = []
                     total_pages = 0
                     total_chunks = 0
+                    total_ocr_pages_admin = 0
 
                     progress_bar = st.progress(0)
                     progress_text = st.empty()
@@ -1245,7 +1340,7 @@ with tab_admin:
                         }
 
                         try:
-                            new_chunks, page_count, _ = (
+                            new_chunks, page_count, _, ocr_pages = (
                                 pdf_to_chunks(
                                     pdf_bytes=(
                                         uploaded_file.getvalue()
@@ -1277,6 +1372,7 @@ with tab_admin:
                                 successful_files += 1
                                 total_pages += page_count
                                 total_chunks += len(new_chunks)
+                                total_ocr_pages_admin += ocr_pages
 
                         except Exception as exc:
                             failed_files.append(
@@ -1294,6 +1390,11 @@ with tab_admin:
                             f"Supabase, {total_pages} trang và "
                             f"{total_chunks} đoạn dữ liệu."
                         )
+                        if total_ocr_pages_admin:
+                            st.info(
+                                f"Đã tự động OCR "
+                                f"{total_ocr_pages_admin} trang scan."
+                            )
 
                     if failed_files:
                         st.error(
@@ -1361,7 +1462,8 @@ kho dùng chung.
 
 ### Giới hạn
 
-- Chỉ đọc PDF có lớp chữ; chưa hỗ trợ OCR cho PDF scan.
+- Tự động OCR các trang PDF scan khi không có đủ lớp chữ.
+- OCR có thể nhận sai số hiệu, số tiền hoặc dấu tiếng Việt; cần đối chiếu trang gốc.
 - Kho dùng chung được lưu bền vững trong Supabase.
 - Kết quả không thay thế tư vấn chính thức của cơ quan thuế.
 """
