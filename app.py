@@ -14,7 +14,7 @@ from google import genai
 from scipy.sparse import hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from supabase import Client, create_client
+import requests
 
 
 # ============================================================
@@ -57,11 +57,6 @@ def get_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-@st.cache_resource(show_spinner=False)
-def get_supabase_client() -> Client | None:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================================
@@ -81,48 +76,111 @@ for key, default_value in SESSION_DEFAULTS.items():
 
 
 # ============================================================
-# KHO DỮ LIỆU DÙNG CHUNG - SUPABASE
+# KHO DỮ LIỆU DÙNG CHUNG - SUPABASE REST API
 # ============================================================
 
-def require_supabase() -> Client:
-    client = get_supabase_client()
-    if client is None:
+def supabase_rest_base() -> str:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError(
             "Chưa cấu hình SUPABASE_URL hoặc SUPABASE_KEY."
         )
-    return client
+    return SUPABASE_URL.rstrip("/") + "/rest/v1"
+
+
+def supabase_headers(
+    prefer: str | None = None,
+) -> dict[str, str]:
+    """
+    Key mới dạng sb_secret_ được gửi qua header apikey.
+    Không đặt sb_secret_ vào Authorization: Bearer vì đây
+    không phải JWT legacy service_role.
+    """
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def rest_request(
+    method: str,
+    table: str,
+    *,
+    params: dict[str, str] | None = None,
+    json_data: Any = None,
+    prefer: str | None = None,
+) -> Any:
+    url = f"{supabase_rest_base()}/{table}"
+    response = requests.request(
+        method=method,
+        url=url,
+        headers=supabase_headers(prefer),
+        params=params,
+        json=json_data,
+        timeout=45,
+    )
+
+    if not response.ok:
+        detail = response.text[:1200]
+        raise RuntimeError(
+            f"Supabase HTTP {response.status_code}: {detail}"
+        )
+
+    if not response.content:
+        return None
+
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
+
+
+def test_supabase_connection() -> tuple[bool, str]:
+    try:
+        rest_request(
+            "GET",
+            "documents",
+            params={
+                "select": "id",
+                "limit": "1",
+            },
+        )
+        return True, "Kết nối Supabase thành công."
+    except Exception as exc:
+        return False, str(exc)
 
 
 def list_documents() -> list[dict[str, Any]]:
-    client = require_supabase()
-    response = (
-        client.table("documents")
-        .select("*")
-        .order("uploaded_at", desc=True)
-        .execute()
+    data = rest_request(
+        "GET",
+        "documents",
+        params={
+            "select": "*",
+            "order": "uploaded_at.desc",
+        },
     )
-    return response.data or []
+    return data or []
 
 
 def load_shared_chunks() -> list[dict[str, Any]]:
-    """Đọc toàn bộ chunks và ghép metadata của documents."""
-    client = require_supabase()
+    documents = rest_request(
+        "GET",
+        "documents",
+        params={"select": "*"},
+    ) or []
 
-    documents_response = (
-        client.table("documents")
-        .select("*")
-        .range(0, 9999)
-        .execute()
-    )
-    chunk_response = (
-        client.table("chunks")
-        .select("*")
-        .range(0, 9999)
-        .execute()
-    )
+    chunks = rest_request(
+        "GET",
+        "chunks",
+        params={
+            "select": "*",
+            "order": "chunk_index.asc",
+        },
+    ) or []
 
-    documents = documents_response.data or []
-    chunks = chunk_response.data or []
     document_map = {
         item["id"]: item
         for item in documents
@@ -172,31 +230,34 @@ def load_shared_chunks() -> list[dict[str, Any]]:
     return merged
 
 
+def delete_document_from_supabase(document_id: str) -> None:
+    rest_request(
+        "DELETE",
+        "documents",
+        params={"id": f"eq.{document_id}"},
+        prefer="return=minimal",
+    )
+
+
 def upsert_document_to_supabase(
     metadata: dict[str, Any],
     chunks: list[dict[str, Any]],
     page_count: int,
     uploaded_by: str,
 ) -> str:
-    """
-    Nếu số hiệu đã tồn tại thì xóa bản cũ.
-    ON DELETE CASCADE sẽ tự xóa chunks cũ.
-    """
-    client = require_supabase()
     document_number = metadata["document_number"]
 
-    existing_response = (
-        client.table("documents")
-        .select("id")
-        .eq("document_number", document_number)
-        .execute()
-    )
+    existing = rest_request(
+        "GET",
+        "documents",
+        params={
+            "select": "id",
+            "document_number": f"eq.{document_number}",
+        },
+    ) or []
 
-    for existing in existing_response.data or []:
-        client.table("documents").delete().eq(
-            "id",
-            existing["id"],
-        ).execute()
+    for item in existing:
+        delete_document_from_supabase(item["id"])
 
     document_payload = {
         "document_name": metadata["document_name"],
@@ -213,18 +274,19 @@ def upsert_document_to_supabase(
         "chunk_count": len(chunks),
     }
 
-    insert_response = (
-        client.table("documents")
-        .insert(document_payload)
-        .execute()
+    inserted = rest_request(
+        "POST",
+        "documents",
+        json_data=document_payload,
+        prefer="return=representation",
     )
 
-    if not insert_response.data:
+    if not inserted:
         raise RuntimeError("Không tạo được bản ghi documents.")
 
-    document_id = insert_response.data[0]["id"]
+    document_id = inserted[0]["id"]
 
-    chunk_payloads = [
+    payloads = [
         {
             "document_id": document_id,
             "chunk_index": index,
@@ -234,30 +296,25 @@ def upsert_document_to_supabase(
         for index, item in enumerate(chunks)
     ]
 
-    batch_size = 300
-    for start in range(0, len(chunk_payloads), batch_size):
-        batch = chunk_payloads[start:start + batch_size]
-        client.table("chunks").insert(batch).execute()
+    batch_size = 200
+
+    for batch_start in range(0, len(payloads), batch_size):
+        rest_request(
+            "POST",
+            "chunks",
+            json_data=payloads[
+                batch_start:batch_start + batch_size
+            ],
+            prefer="return=minimal",
+        )
 
     return document_id
 
 
-def delete_document_from_supabase(document_id: str) -> None:
-    client = require_supabase()
-    client.table("documents").delete().eq(
-        "id",
-        document_id,
-    ).execute()
-
-
 def delete_all_documents_from_supabase() -> None:
-    client = require_supabase()
     documents = list_documents()
     for document in documents:
-        client.table("documents").delete().eq(
-            "id",
-            document["id"],
-        ).execute()
+        delete_document_from_supabase(document["id"])
 
 
 # ============================================================
@@ -918,6 +975,17 @@ with tab_admin:
             )
         else:
             st.success("Đã mở quyền quản trị.")
+
+            connection_ok, connection_message = (
+                test_supabase_connection()
+            )
+            if connection_ok:
+                st.success("Supabase: kết nối thành công.")
+            else:
+                st.error(
+                    "Supabase chưa kết nối được: "
+                    + connection_message
+                )
 
             admin_display_name = st.text_input(
                 "Tên người quản trị",
