@@ -14,6 +14,7 @@ from google import genai
 from scipy.sparse import hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from supabase import Client, create_client
 
 
 # ============================================================
@@ -27,10 +28,6 @@ st.set_page_config(
 )
 
 load_dotenv()
-
-DATA_DIR = Path("data_store")
-SHARED_DATA_FILE = DATA_DIR / "shared_chunks.json"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_PRIVATE_FILES = 5
 MAX_PRIVATE_TOTAL_MB = 30
@@ -49,6 +46,8 @@ def get_setting(name: str, default: str = "") -> str:
 GEMINI_API_KEY = get_setting("GEMINI_API_KEY")
 GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.6-flash")
 ADMIN_PASSWORD = get_setting("ADMIN_PASSWORD")
+SUPABASE_URL = get_setting("SUPABASE_URL")
+SUPABASE_KEY = get_setting("SUPABASE_KEY")
 
 
 @st.cache_resource(show_spinner=False)
@@ -56,6 +55,13 @@ def get_gemini_client():
     if not GEMINI_API_KEY:
         return None
     return genai.Client(api_key=GEMINI_API_KEY)
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client() -> Client | None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================================
@@ -75,27 +81,183 @@ for key, default_value in SESSION_DEFAULTS.items():
 
 
 # ============================================================
-# KHO DỮ LIỆU DÙNG CHUNG
+# KHO DỮ LIỆU DÙNG CHUNG - SUPABASE
 # ============================================================
 
-def load_shared_chunks() -> list[dict[str, Any]]:
-    if not SHARED_DATA_FILE.exists():
-        return []
-
-    try:
-        data = json.loads(SHARED_DATA_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+def require_supabase() -> Client:
+    client = get_supabase_client()
+    if client is None:
+        raise RuntimeError(
+            "Chưa cấu hình SUPABASE_URL hoặc SUPABASE_KEY."
+        )
+    return client
 
 
-def save_shared_chunks(chunks: list[dict[str, Any]]) -> None:
-    temp_file = SHARED_DATA_FILE.with_suffix(".tmp")
-    temp_file.write_text(
-        json.dumps(chunks, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+def list_documents() -> list[dict[str, Any]]:
+    client = require_supabase()
+    response = (
+        client.table("documents")
+        .select("*")
+        .order("uploaded_at", desc=True)
+        .execute()
     )
-    temp_file.replace(SHARED_DATA_FILE)
+    return response.data or []
+
+
+def load_shared_chunks() -> list[dict[str, Any]]:
+    """Đọc toàn bộ chunks và ghép metadata của documents."""
+    client = require_supabase()
+
+    documents_response = (
+        client.table("documents")
+        .select("*")
+        .range(0, 9999)
+        .execute()
+    )
+    chunk_response = (
+        client.table("chunks")
+        .select("*")
+        .range(0, 9999)
+        .execute()
+    )
+
+    documents = documents_response.data or []
+    chunks = chunk_response.data or []
+    document_map = {
+        item["id"]: item
+        for item in documents
+    }
+
+    merged: list[dict[str, Any]] = []
+
+    for chunk in chunks:
+        document = document_map.get(chunk.get("document_id"))
+        if not document:
+            continue
+
+        merged.append(
+            {
+                "id": chunk.get("id"),
+                "document_id": chunk.get("document_id"),
+                "chunk_index": chunk.get("chunk_index"),
+                "page": chunk.get("page_number"),
+                "content": chunk.get("content", ""),
+                "document_name": document.get(
+                    "document_name",
+                    "",
+                ),
+                "document_number": document.get(
+                    "document_number",
+                    "",
+                ),
+                "topic": document.get("topic", ""),
+                "status": document.get("status", ""),
+                "source_url": document.get(
+                    "source_url",
+                    "",
+                ),
+                "filename": document.get("filename", ""),
+                "uploaded_by": document.get(
+                    "uploaded_by",
+                    "",
+                ),
+                "uploaded_at": document.get(
+                    "uploaded_at",
+                    "",
+                ),
+                "scope": "shared",
+            }
+        )
+
+    return merged
+
+
+def upsert_document_to_supabase(
+    metadata: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    page_count: int,
+    uploaded_by: str,
+) -> str:
+    """
+    Nếu số hiệu đã tồn tại thì xóa bản cũ.
+    ON DELETE CASCADE sẽ tự xóa chunks cũ.
+    """
+    client = require_supabase()
+    document_number = metadata["document_number"]
+
+    existing_response = (
+        client.table("documents")
+        .select("id")
+        .eq("document_number", document_number)
+        .execute()
+    )
+
+    for existing in existing_response.data or []:
+        client.table("documents").delete().eq(
+            "id",
+            existing["id"],
+        ).execute()
+
+    document_payload = {
+        "document_name": metadata["document_name"],
+        "document_number": document_number,
+        "topic": metadata.get("topic", ""),
+        "status": metadata.get(
+            "status",
+            "Chưa xác minh",
+        ),
+        "source_url": metadata.get("source_url", ""),
+        "filename": metadata.get("filename", ""),
+        "uploaded_by": uploaded_by or "Admin",
+        "page_count": page_count,
+        "chunk_count": len(chunks),
+    }
+
+    insert_response = (
+        client.table("documents")
+        .insert(document_payload)
+        .execute()
+    )
+
+    if not insert_response.data:
+        raise RuntimeError("Không tạo được bản ghi documents.")
+
+    document_id = insert_response.data[0]["id"]
+
+    chunk_payloads = [
+        {
+            "document_id": document_id,
+            "chunk_index": index,
+            "page_number": item.get("page"),
+            "content": item.get("content", ""),
+        }
+        for index, item in enumerate(chunks)
+    ]
+
+    batch_size = 300
+    for start in range(0, len(chunk_payloads), batch_size):
+        batch = chunk_payloads[start:start + batch_size]
+        client.table("chunks").insert(batch).execute()
+
+    return document_id
+
+
+def delete_document_from_supabase(document_id: str) -> None:
+    client = require_supabase()
+    client.table("documents").delete().eq(
+        "id",
+        document_id,
+    ).execute()
+
+
+def delete_all_documents_from_supabase() -> None:
+    client = require_supabase()
+    documents = list_documents()
+    for document in documents:
+        client.table("documents").delete().eq(
+            "id",
+            document["id"],
+        ).execute()
 
 
 # ============================================================
@@ -438,10 +600,11 @@ with tab_shared:
             key="shared_threshold",
         )
 
-        st.metric(
-            "Số đoạn trong kho",
-            len(load_shared_chunks()),
-        )
+        try:
+            shared_chunk_count = len(load_shared_chunks())
+        except Exception:
+            shared_chunk_count = 0
+        st.metric("Số đoạn trong kho", shared_chunk_count)
 
     with right:
         for message in st.session_state.shared_messages:
@@ -523,7 +686,8 @@ with tab_private:
 
     st.info(
         "Tài liệu chỉ được giữ trong phiên sử dụng hiện tại và không "
-        "được thêm vào kho dùng chung."
+        "được thêm vào kho dùng chung. Các đoạn liên quan sẽ được gửi "
+        "tới Gemini API để tạo câu trả lời."
     )
 
     private_files = st.file_uploader(
@@ -747,223 +911,353 @@ with tab_admin:
                 st.error("Mật khẩu không đúng.")
 
     if admin_allowed:
-        st.success("Đã mở quyền quản trị.")
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            st.error(
+                "Chưa cấu hình SUPABASE_URL hoặc SUPABASE_KEY "
+                "trong Streamlit Secrets."
+            )
+        else:
+            st.success("Đã mở quyền quản trị.")
 
-        admin_files = st.file_uploader(
-            "Chọn một hoặc nhiều PDF có lớp chữ",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key="admin_uploader",
-            help=(
-                "Có thể tải nhiều văn bản cùng lúc. "
-                "Mỗi file cần nhập metadata riêng."
-            ),
-        )
-
-        admin_entries: list[dict[str, Any]] = []
-
-        if admin_files:
-            st.caption(
-                f"Đã chọn {len(admin_files)} file. "
-                "Hãy kiểm tra metadata của từng văn bản."
+            admin_display_name = st.text_input(
+                "Tên người quản trị",
+                placeholder="Ví dụ: Nguyễn Văn A",
+                help=(
+                    "Tên này được lưu cùng tài liệu để các admin "
+                    "biết ai đã tải lên."
+                ),
             )
 
-            if len(admin_files) > 20:
+            st.divider()
+            st.markdown("### Tài liệu hiện có trong kho")
+
+            try:
+                documents = list_documents()
+            except Exception as exc:
+                documents = []
                 st.error(
-                    "Mỗi lần chỉ nên xử lý tối đa 20 file để tránh "
-                    "quá tải bộ nhớ."
+                    "Không đọc được Supabase. Hãy kiểm tra URL, "
+                    "Secret key và hai bảng documents/chunks."
                 )
 
-            for file_index, admin_file in enumerate(
-                admin_files,
-                start=1,
-            ):
-                widget_id = sha256(
-                    (
-                        f"{file_index}|{admin_file.name}|"
-                        f"{admin_file.size}"
-                    ).encode("utf-8")
-                ).hexdigest()[:12]
-
-                default_name = Path(admin_file.name).stem
-
-                with st.expander(
-                    f"{file_index}. {admin_file.name}",
-                    expanded=(len(admin_files) <= 3),
-                ):
-                    document_name = st.text_input(
-                        "Tên văn bản",
-                        value=default_name,
-                        key=f"admin_name_{widget_id}",
-                    )
-
-                    document_number = st.text_input(
-                        "Số hiệu văn bản",
-                        placeholder="Ví dụ: 48/2024/QH15",
-                        key=f"admin_number_{widget_id}",
-                    )
-
-                    topic = st.selectbox(
-                        "Chủ đề",
-                        [
-                            "Thuế giá trị gia tăng",
-                            "Hóa đơn điện tử",
-                            "Thủ tục khai và nộp thuế",
-                        ],
-                        key=f"admin_topic_{widget_id}",
-                    )
-
-                    status = st.selectbox(
-                        "Trạng thái",
-                        [
-                            "Còn hiệu lực",
-                            "Hết hiệu lực",
-                            "Chưa xác minh",
-                        ],
-                        key=f"admin_status_{widget_id}",
-                    )
-
-                    source_url = st.text_input(
-                        "URL nguồn chính thức",
-                        placeholder="https://...",
-                        key=f"admin_url_{widget_id}",
-                    )
-
-                admin_entries.append(
+            if documents:
+                document_rows = [
                     {
-                        "file": admin_file,
-                        "document_name": document_name.strip(),
-                        "document_number": document_number.strip(),
-                        "topic": topic,
-                        "status": status,
-                        "source_url": source_url.strip(),
+                        "Tên văn bản": item.get(
+                            "document_name",
+                            "",
+                        ),
+                        "Số hiệu": item.get(
+                            "document_number",
+                            "",
+                        ),
+                        "Chủ đề": item.get("topic", ""),
+                        "Trạng thái": item.get(
+                            "status",
+                            "",
+                        ),
+                        "Số trang": item.get(
+                            "page_count",
+                            0,
+                        ),
+                        "Số đoạn": item.get(
+                            "chunk_count",
+                            0,
+                        ),
+                        "Người tải": item.get(
+                            "uploaded_by",
+                            "",
+                        ),
+                        "Ngày tải": item.get(
+                            "uploaded_at",
+                            "",
+                        ),
                     }
+                    for item in documents
+                ]
+
+                st.dataframe(
+                    document_rows,
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
-        if st.button(
-            "Xử lý và lưu tất cả vào kho dùng chung",
-            type="primary",
-            disabled=not admin_files or len(admin_files) > 20,
-        ):
-            missing_metadata = [
-                entry["file"].name
-                for entry in admin_entries
-                if not entry["document_name"]
-                or not entry["document_number"]
-            ]
+                document_options = {
+                    (
+                        f"{item.get('document_number', '')} — "
+                        f"{item.get('document_name', '')}"
+                    ): item["id"]
+                    for item in documents
+                }
 
-            if missing_metadata:
-                st.error(
-                    "Các file sau còn thiếu tên văn bản hoặc số hiệu: "
-                    + ", ".join(missing_metadata)
+                selected_document_label = st.selectbox(
+                    "Chọn tài liệu để xóa",
+                    options=list(document_options.keys()),
                 )
+
+                confirm_single_delete = st.checkbox(
+                    "Tôi xác nhận xóa tài liệu đã chọn",
+                    key="confirm_single_delete",
+                )
+
+                if st.button(
+                    "Xóa tài liệu đã chọn",
+                    disabled=not confirm_single_delete,
+                ):
+                    try:
+                        delete_document_from_supabase(
+                            document_options[
+                                selected_document_label
+                            ]
+                        )
+                        st.success(
+                            "Đã xóa tài liệu và toàn bộ chunks "
+                            "liên quan."
+                        )
+                        st.rerun()
+                    except Exception:
+                        st.error(
+                            "Không xóa được tài liệu trong Supabase."
+                        )
             else:
-                current_chunks = load_shared_chunks()
-                successful_files = 0
-                failed_files: list[str] = []
-                total_pages = 0
-                total_chunks = 0
-                total_empty_pages = 0
+                st.info("Kho dữ liệu hiện chưa có tài liệu.")
 
-                progress_bar = st.progress(0)
-                progress_text = st.empty()
+            st.divider()
+            st.markdown("### Tải tài liệu mới")
 
-                for entry_index, entry in enumerate(
-                    admin_entries,
+            admin_files = st.file_uploader(
+                "Chọn một hoặc nhiều PDF có lớp chữ",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key="admin_uploader",
+                help=(
+                    "Có thể tải nhiều văn bản cùng lúc. "
+                    "Mỗi file cần nhập metadata riêng."
+                ),
+            )
+
+            admin_entries: list[dict[str, Any]] = []
+
+            if admin_files:
+                st.caption(
+                    f"Đã chọn {len(admin_files)} file. "
+                    "Hãy kiểm tra metadata của từng văn bản."
+                )
+
+                if len(admin_files) > 20:
+                    st.error(
+                        "Mỗi lần chỉ xử lý tối đa 20 file."
+                    )
+
+                for file_index, admin_file in enumerate(
+                    admin_files,
                     start=1,
                 ):
-                    uploaded_file = entry["file"]
+                    widget_id = sha256(
+                        (
+                            f"{file_index}|{admin_file.name}|"
+                            f"{admin_file.size}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:12]
 
-                    progress_text.write(
-                        f"Đang xử lý {entry_index}/"
-                        f"{len(admin_entries)}: "
-                        f"{uploaded_file.name}"
-                    )
+                    default_name = Path(admin_file.name).stem
 
-                    metadata = {
-                        "document_name": entry["document_name"],
-                        "document_number": entry["document_number"],
-                        "topic": entry["topic"],
-                        "status": entry["status"],
-                        "source_url": entry["source_url"],
-                    }
-
-                    try:
-                        new_chunks, page_count, empty_pages = (
-                            pdf_to_chunks(
-                                pdf_bytes=uploaded_file.getvalue(),
-                                filename=uploaded_file.name,
-                                metadata=metadata,
-                                scope="shared",
-                            )
+                    with st.expander(
+                        f"{file_index}. {admin_file.name}",
+                        expanded=(len(admin_files) <= 3),
+                    ):
+                        document_name = st.text_input(
+                            "Tên văn bản",
+                            value=default_name,
+                            key=f"admin_name_{widget_id}",
                         )
 
-                        if not new_chunks:
-                            failed_files.append(
-                                f"{uploaded_file.name} "
-                                "(không trích xuất được chữ)"
-                            )
-                        else:
-                            current_chunks = [
-                                item
-                                for item in current_chunks
-                                if item.get("document_number")
-                                != entry["document_number"]
-                            ]
-
-                            current_chunks.extend(new_chunks)
-                            successful_files += 1
-                            total_pages += page_count
-                            total_chunks += len(new_chunks)
-                            total_empty_pages += empty_pages
-
-                    except Exception:
-                        failed_files.append(
-                            f"{uploaded_file.name} "
-                            "(file lỗi, được bảo vệ hoặc là PDF scan)"
+                        document_number = st.text_input(
+                            "Số hiệu văn bản",
+                            placeholder="Ví dụ: 48/2024/QH15",
+                            key=f"admin_number_{widget_id}",
                         )
 
-                    progress_bar.progress(
-                        entry_index / len(admin_entries)
-                    )
-
-                if successful_files:
-                    save_shared_chunks(current_chunks)
-
-                    st.success(
-                        f"Đã lưu {successful_files}/"
-                        f"{len(admin_entries)} văn bản, "
-                        f"{total_pages} trang và "
-                        f"{total_chunks} đoạn dữ liệu."
-                    )
-
-                    if total_empty_pages:
-                        st.warning(
-                            f"Có {total_empty_pages} trang không "
-                            "trích xuất được chữ."
+                        topic = st.selectbox(
+                            "Chủ đề",
+                            [
+                                "Thuế giá trị gia tăng",
+                                "Hóa đơn điện tử",
+                                "Thủ tục khai và nộp thuế",
+                            ],
+                            key=f"admin_topic_{widget_id}",
                         )
 
-                if failed_files:
+                        status = st.selectbox(
+                            "Trạng thái",
+                            [
+                                "Còn hiệu lực",
+                                "Hết hiệu lực",
+                                "Chưa xác minh",
+                            ],
+                            key=f"admin_status_{widget_id}",
+                        )
+
+                        source_url = st.text_input(
+                            "URL nguồn chính thức",
+                            placeholder="https://...",
+                            key=f"admin_url_{widget_id}",
+                        )
+
+                    admin_entries.append(
+                        {
+                            "file": admin_file,
+                            "document_name": (
+                                document_name.strip()
+                            ),
+                            "document_number": (
+                                document_number.strip()
+                            ),
+                            "topic": topic,
+                            "status": status,
+                            "source_url": source_url.strip(),
+                        }
+                    )
+
+            if st.button(
+                "Xử lý và lưu tất cả vào Supabase",
+                type="primary",
+                disabled=(
+                    not admin_files
+                    or len(admin_files) > 20
+                ),
+            ):
+                missing_metadata = [
+                    entry["file"].name
+                    for entry in admin_entries
+                    if not entry["document_name"]
+                    or not entry["document_number"]
+                ]
+
+                if missing_metadata:
                     st.error(
-                        "Không xử lý được: "
-                        + "; ".join(failed_files)
+                        "Các file sau còn thiếu tên văn bản "
+                        "hoặc số hiệu: "
+                        + ", ".join(missing_metadata)
                     )
+                else:
+                    successful_files = 0
+                    failed_files: list[str] = []
+                    total_pages = 0
+                    total_chunks = 0
 
-                progress_text.empty()
+                    progress_bar = st.progress(0)
+                    progress_text = st.empty()
 
-        st.divider()
+                    for entry_index, entry in enumerate(
+                        admin_entries,
+                        start=1,
+                    ):
+                        uploaded_file = entry["file"]
 
-        confirm_delete = st.checkbox(
-            "Tôi xác nhận muốn xóa toàn bộ kho dùng chung"
-        )
+                        progress_text.write(
+                            f"Đang xử lý {entry_index}/"
+                            f"{len(admin_entries)}: "
+                            f"{uploaded_file.name}"
+                        )
 
-        if st.button(
-            "Xóa toàn bộ dữ liệu dùng chung",
-            disabled=not confirm_delete,
-        ):
-            save_shared_chunks([])
-            st.session_state.shared_messages = []
-            st.success("Đã xóa toàn bộ kho dữ liệu dùng chung.")
+                        metadata = {
+                            "document_name": (
+                                entry["document_name"]
+                            ),
+                            "document_number": (
+                                entry["document_number"]
+                            ),
+                            "topic": entry["topic"],
+                            "status": entry["status"],
+                            "source_url": (
+                                entry["source_url"]
+                            ),
+                            "filename": uploaded_file.name,
+                        }
+
+                        try:
+                            new_chunks, page_count, _ = (
+                                pdf_to_chunks(
+                                    pdf_bytes=(
+                                        uploaded_file.getvalue()
+                                    ),
+                                    filename=(
+                                        uploaded_file.name
+                                    ),
+                                    metadata=metadata,
+                                    scope="shared",
+                                )
+                            )
+
+                            if not new_chunks:
+                                failed_files.append(
+                                    f"{uploaded_file.name} "
+                                    "(không trích xuất được chữ)"
+                                )
+                            else:
+                                upsert_document_to_supabase(
+                                    metadata=metadata,
+                                    chunks=new_chunks,
+                                    page_count=page_count,
+                                    uploaded_by=(
+                                        admin_display_name.strip()
+                                        or "Admin"
+                                    ),
+                                )
+
+                                successful_files += 1
+                                total_pages += page_count
+                                total_chunks += len(new_chunks)
+
+                        except Exception as exc:
+                            failed_files.append(
+                                f"{uploaded_file.name}: {exc}"
+                            )
+
+                        progress_bar.progress(
+                            entry_index / len(admin_entries)
+                        )
+
+                    if successful_files:
+                        st.success(
+                            f"Đã lưu {successful_files}/"
+                            f"{len(admin_entries)} văn bản vào "
+                            f"Supabase, {total_pages} trang và "
+                            f"{total_chunks} đoạn dữ liệu."
+                        )
+
+                    if failed_files:
+                        st.error(
+                            "Không xử lý được: "
+                            + "; ".join(failed_files)
+                        )
+
+                    progress_text.empty()
+
+            st.divider()
+            st.markdown("### Xóa toàn bộ kho dữ liệu")
+
+            confirm_delete_all = st.checkbox(
+                "Tôi xác nhận muốn xóa toàn bộ kho dùng chung",
+                key="confirm_delete_all",
+            )
+
+            if st.button(
+                "Xóa toàn bộ dữ liệu dùng chung",
+                disabled=not confirm_delete_all,
+            ):
+                try:
+                    delete_all_documents_from_supabase()
+                    st.session_state.shared_messages = []
+                    st.success(
+                        "Đã xóa toàn bộ tài liệu và chunks."
+                    )
+                    st.rerun()
+                except Exception:
+                    st.error(
+                        "Không thể xóa toàn bộ dữ liệu trong Supabase."
+                    )
 
 
 # ------------------------------------------------------------
@@ -1000,7 +1294,7 @@ kho dùng chung.
 ### Giới hạn
 
 - Chỉ đọc PDF có lớp chữ; chưa hỗ trợ OCR cho PDF scan.
-- Kho dùng chung có thể mất khi Streamlit Cloud tạo lại môi trường.
+- Kho dùng chung được lưu bền vững trong Supabase.
 - Kết quả không thay thế tư vấn chính thức của cơ quan thuế.
 """
     )
