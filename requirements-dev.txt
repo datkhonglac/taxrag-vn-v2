@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8
+# Tùy chọn cho thực nghiệm (không cần khi triển khai Streamlit Cloud):
+# sentence-transformers>=3   # cross-encoder reranker, embedding mã nguồn mở
+# pyvi / underthesea         # tách từ tiếng Việt để so sánh với bigram âm tiết
