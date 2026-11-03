@@ -11,7 +11,7 @@ st.set_page_config(page_title="TaxRAG VN – Hỏi đáp chính sách thuế", p
                    layout="wide", initial_sidebar_state="expanded")
 
 from taxrag.services import get_settings  # noqa: E402
-from taxrag.ui import inject_css  # noqa: E402
+from taxrag.ui import brand, inject_css  # noqa: E402
 
 inject_css()
 settings = get_settings()
@@ -25,9 +25,13 @@ pages = [
 if st.session_state.is_admin:
     pages.append(st.Page("views/quan_tri.py", title="Quản trị dữ liệu", icon=":material/admin_panel_settings:"))
 
-nav = st.navigation(pages)
+# Ẩn menu mặc định (luôn nằm trên cùng) để đặt logo lên đầu thanh bên
+nav = st.navigation(pages, position="hidden")
 
 with st.sidebar:
+    brand()
+    for page in pages:
+        st.page_link(page)  # dùng tiêu đề và biểu tượng của trang
     st.divider()
     if st.session_state.is_admin:
         if st.button("Đăng xuất quản trị", use_container_width=True):
